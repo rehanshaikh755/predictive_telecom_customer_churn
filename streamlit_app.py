@@ -1,15 +1,25 @@
-"""Streamlit demo: score a customer with the saved ConnectTel churn model.
-Run:  streamlit run app.py      (needs connecttel_churn_model.joblib from the notebook)
+"""ConnectTel Churn Predictor (Streamlit).
+
+The model is rebuilt from the Telco CSV when the app starts, using the tuned settings from the project
+notebook (same 80/20 stratified split and seed). This avoids scikit-learn pickle-version problems.
+Needs WA_Fn-UseC_-Telco-Customer-Churn.csv in the same folder as this file.
 """
+import os
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 st.set_page_config(page_title="ConnectTel Churn Predictor", page_icon="📉")
 
-@st.cache_resource
-def load():
-    return joblib.load("connecttel_churn_model.joblib")
+CSV_NAME = "WA_Fn-UseC_-Telco-Customer-Churn.csv"
+THRESHOLD = 0.26  # profit-optimal threshold found in the notebook (placeholder cost assumptions)
+SEED = 42
+
 
 def engineer_features(d: pd.DataFrame) -> pd.DataFrame:
     d = d.copy()
@@ -23,13 +33,57 @@ def engineer_features(d: pd.DataFrame) -> pd.DataFrame:
     d["AutoPay"] = d["PaymentMethod"].str.contains("automatic", case=False).astype(int)
     return d
 
+
+def find_csv():
+    for p in (CSV_NAME, os.path.join("data", CSV_NAME)):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def make_classifier(pos_weight):
+    try:
+        from xgboost import XGBClassifier
+        return XGBClassifier(n_estimators=200, learning_rate=0.03, max_depth=3, min_child_weight=1,
+                             subsample=0.8, colsample_bytree=0.8, scale_pos_weight=pos_weight,
+                             eval_metric="auc", n_jobs=1, random_state=SEED), "XGBoost"
+    except Exception:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        return HistGradientBoostingClassifier(learning_rate=0.03, max_depth=3, max_iter=200,
+                                              class_weight="balanced", random_state=SEED), "Gradient boosting (sklearn fallback)"
+
+
+@st.cache_resource(show_spinner="Preparing the model (first load only)...")
+def load_model():
+    path = find_csv()
+    if path is None:
+        return None
+    df = pd.read_csv(path)
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"].replace(" ", np.nan), errors="coerce").fillna(0.0)
+    df["Churn"] = (df["Churn"] == "Yes").astype(int)
+    df["SeniorCitizen"] = df["SeniorCitizen"].map({0: "No", 1: "Yes"})
+    df = engineer_features(df.drop(columns=["customerID"]))
+    X, y = df.drop(columns=["Churn"]), df["Churn"]
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.20, stratify=y, random_state=SEED)
+
+    cat = X.select_dtypes(include="object").columns.tolist()
+    num = X.select_dtypes(exclude="object").columns.tolist()
+    prep = ColumnTransformer([
+        ("num", StandardScaler(), num),
+        ("cat", OneHotEncoder(drop="if_binary", handle_unknown="ignore", sparse_output=False), cat),
+    ], sparse_threshold=0)
+    clf, name = make_classifier((y_train == 0).sum() / (y_train == 1).sum())
+    pipe = Pipeline([("prep", prep), ("clf", clf)]).fit(X_train, y_train)
+    return {"pipeline": pipe, "features": X.columns.tolist(), "name": name}
+
+
+# ---- UI ----
 st.title("ConnectTel Churn Predictor")
 st.caption("Enter a customer profile to estimate churn risk.")
 
-try:
-    bundle = load()
-except FileNotFoundError:
-    st.error("connecttel_churn_model.joblib not found. Run the notebook (last cell) first.")
+bundle = load_model()
+if bundle is None:
+    st.error(f"{CSV_NAME} not found. Upload it to the same folder as streamlit_app.py in the GitHub repo.")
     st.stop()
 
 yn = ["Yes", "No"]
@@ -68,11 +122,10 @@ row = pd.DataFrame([{
 if st.button("Predict churn risk", type="primary"):
     X = engineer_features(row)[bundle["features"]]
     p = float(bundle["pipeline"].predict_proba(X)[0, 1])
-    thr = bundle["threshold"]
     st.metric("Churn probability", f"{p:.1%}")
     st.progress(min(p, 1.0))
-    if p >= thr:
-        st.error(f"HIGH RISK (above threshold {thr:.2f}): recommend a retention offer.")
+    if p >= THRESHOLD:
+        st.error(f"HIGH RISK (above threshold {THRESHOLD:.2f}): recommend a retention offer.")
     else:
-        st.success(f"Lower risk (below threshold {thr:.2f}).")
-
+        st.success(f"Lower risk (below threshold {THRESHOLD:.2f}).")
+    st.caption(f"Model: {bundle['name']}")
